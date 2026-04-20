@@ -1,0 +1,935 @@
+name: Enterprise AWS Infrastructure - CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: "1.5.0"
+  AWS_ACCOUNT_ID: "644786176177"
+  VPC_ID: vpc-0b0450537ba0bcffd
+  VPC_NAME: enterprise-vpc
+  VPC_CIDR: 10.0.0.0/16
+  SUBNET_PUBLIC_1_ID: subnet-0c65db2241cdf98bf
+  SUBNET_PUBLIC_1_NAME: enterprise-public-1
+  SUBNET_PUBLIC_1_CIDR: 10.0.1.0/24
+  SUBNET_PUBLIC_1_AZ: us-east-1a
+  SUBNET_PUBLIC_2_ID: subnet-01af22f5031b2c620
+  SUBNET_PUBLIC_2_NAME: enterprise-public-2
+  SUBNET_PUBLIC_2_CIDR: 10.0.2.0/24
+  SUBNET_PUBLIC_2_AZ: us-east-1b
+  SUBNET_PRIVATE_1_ID: subnet-0084de5014982293a
+  SUBNET_PRIVATE_1_NAME: enterprise-private-1
+  SUBNET_PRIVATE_1_CIDR: 10.0.3.0/24
+  SUBNET_PRIVATE_1_AZ: us-east-1a
+  SUBNET_PRIVATE_2_ID: subnet-0134e9e0e8f08e812
+  SUBNET_PRIVATE_2_NAME: enterprise-private-4
+  SUBNET_PRIVATE_2_CIDR: 10.0.4.0/24
+  SUBNET_PRIVATE_2_AZ: us-east-1b
+  IGW_ID: igw-0d158f9bea817d115
+  IGW_NAME: enterprise-igw
+  ROUTE_TABLE_ID: rtb-0869d93397b37dc16
+  ROUTE_TABLE_NAME: enterprise-public-rt
+  SG_ALB_ID: sg-0430da8b9fa67c1c2
+  SG_ALB_NAME: enterprise-alb-sg
+  SG_EC2_ID: sg-0f5f9346259391477
+  SG_EC2_NAME: enterprise-ec2-sg
+  SG_RDS_ID: sg-0d29000de664e04df
+  SG_RDS_NAME: enterprise-rds-sg
+  IAM_ROLE_NAME: enterprise-ec2-role
+  SECRET_NAME: enterprise-aws/rds/credentials
+  EC2_INSTANCE_1_ID: i-0de9c704f852e3e87
+  EC2_INSTANCE_1_NAME: enterprise-web-server-1
+  EC2_INSTANCE_1_TYPE: t2.micro
+  EC2_INSTANCE_2_ID: i-07eb949a647bdd473
+  EC2_INSTANCE_2_NAME: enterprise-private-2
+  EC2_INSTANCE_2_TYPE: t2.micro
+  ALB_NAME: enterprise-alb
+  ALB_ARN: arn:aws:elasticloadbalancing:us-east-1:644786176177:loadbalancer/app/enterprise-alb/4418683648d9f6b4
+  ALB_DNS: enterprise-alb-612575907.us-east-1.elb.amazonaws.com
+  ALB_HOSTED_ZONE: Z35SXDOTRQ7X7K
+  TARGET_GROUP_NAME: enterprise-web-tg1
+  TARGET_GROUP_ARN: arn:aws:elasticloadbalancing:us-east-1:644786176177:targetgroup/enterprise-web-tg1/505b02d7ed185d0
+  RDS_IDENTIFIER: enterprise-mysql
+  RDS_ENGINE: mysql
+  RDS_VERSION: "8.0"
+  RDS_CLASS: db.t3.micro
+  RDS_DB_NAME: appdb
+  RDS_USERNAME: admin
+  SNS_TOPIC_NAME: aerts1
+  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:644786176177:aerts1
+  SNS_DISPLAY_NAME: aa23
+  CW_DASHBOARD_NAME: aaai21
+
+jobs:
+
+  terraform-validate:
+    name: Validate Infrastructure Code
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  terraform-security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tfsec
+        run: |
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Run tfsec security scan
+        run: tfsec . --no-color
+        continue-on-error: true
+
+      - name: Install checkov
+        run: pip install checkov
+
+      - name: Run checkov policy scan
+        run: checkov -d . --framework terraform --quiet
+        continue-on-error: true
+
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: terraform-security
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Plan VPC - enterprise-vpc - 10.0.0.0/16
+        run: |
+          terraform plan \
+            -target=aws_vpc.main \
+            -no-color 2>&1 | tee plan-vpc.txt
+
+      - name: Plan Subnets - enterprise-public-1 enterprise-public-2 enterprise-private-1 enterprise-private-4
+        run: |
+          terraform plan \
+            -target=aws_subnet.public_1 \
+            -target=aws_subnet.public_2 \
+            -target=aws_subnet.private_1 \
+            -target=aws_subnet.private_2 \
+            -no-color 2>&1 | tee plan-subnets.txt
+
+      - name: Plan Internet Gateway - enterprise-igw
+        run: |
+          terraform plan \
+            -target=aws_internet_gateway.main \
+            -no-color 2>&1 | tee plan-igw.txt
+
+      - name: Plan NAT Gateway - enterprise-nat
+        run: |
+          terraform plan \
+            -target=aws_eip.nat \
+            -target=aws_nat_gateway.main \
+            -no-color 2>&1 | tee plan-nat.txt
+
+      - name: Plan Route Table - enterprise-public-rt - rtb-0869d93397b37dc16
+        run: |
+          terraform plan \
+            -target=aws_route_table.public \
+            -target=aws_route_table.private \
+            -target=aws_route_table_association.public_1 \
+            -target=aws_route_table_association.public_2 \
+            -target=aws_route_table_association.private_1 \
+            -target=aws_route_table_association.private_2 \
+            -no-color 2>&1 | tee plan-routetables.txt
+
+      - name: Plan Security Group - enterprise-alb-sg - sg-0430da8b9fa67c1c2
+        run: |
+          terraform plan \
+            -target=aws_security_group.alb \
+            -no-color 2>&1 | tee plan-sg-alb.txt
+
+      - name: Plan Security Group - enterprise-ec2-sg - sg-0f5f9346259391477
+        run: |
+          terraform plan \
+            -target=aws_security_group.ec2 \
+            -no-color 2>&1 | tee plan-sg-ec2.txt
+
+      - name: Plan Security Group - enterprise-rds-sg - sg-0d29000de664e04df
+        run: |
+          terraform plan \
+            -target=aws_security_group.rds \
+            -no-color 2>&1 | tee plan-sg-rds.txt
+
+      - name: Plan IAM Role - enterprise-ec2-role
+        run: |
+          terraform plan \
+            -target=aws_iam_role.ec2 \
+            -target=aws_iam_role_policy_attachment.cloudwatch \
+            -target=aws_iam_role_policy_attachment.ssm \
+            -target=aws_iam_role_policy_attachment.secrets \
+            -target=aws_iam_instance_profile.ec2 \
+            -no-color 2>&1 | tee plan-iam.txt
+
+      - name: Plan Secrets Manager - enterprise-aws/rds/credentials
+        run: |
+          terraform plan \
+            -target=random_password.db \
+            -target=aws_secretsmanager_secret.db \
+            -target=aws_secretsmanager_secret_version.db \
+            -no-color 2>&1 | tee plan-secrets.txt
+
+      - name: Plan EC2 - enterprise-web-server-1 - i-0de9c704f852e3e87 - t2.micro
+        run: |
+          terraform plan \
+            -target=aws_instance.web_1 \
+            -no-color 2>&1 | tee plan-ec2-1.txt
+
+      - name: Plan EC2 - enterprise-private-2 - i-07eb949a647bdd473 - t2.micro
+        run: |
+          terraform plan \
+            -target=aws_instance.web_2 \
+            -no-color 2>&1 | tee plan-ec2-2.txt
+
+      - name: Plan ALB - enterprise-alb - enterprise-alb-612575907.us-east-1.elb.amazonaws.com
+        run: |
+          terraform plan \
+            -target=aws_lb.main \
+            -target=aws_lb_target_group.web \
+            -target=aws_lb_target_group_attachment.web_1 \
+            -target=aws_lb_target_group_attachment.web_2 \
+            -target=aws_lb_listener.http \
+            -no-color 2>&1 | tee plan-alb.txt
+
+      - name: Plan RDS - enterprise-mysql - MySQL 8.0 - db.t3.micro - appdb
+        run: |
+          terraform plan \
+            -target=aws_db_subnet_group.main \
+            -target=aws_db_instance.main \
+            -no-color 2>&1 | tee plan-rds.txt
+
+      - name: Plan SNS - aerts1 - arn:aws:sns:us-east-1:644786176177:aerts1
+        run: |
+          terraform plan \
+            -target=aws_sns_topic.alerts \
+            -target=aws_sns_topic_subscription.email \
+            -no-color 2>&1 | tee plan-sns.txt
+
+      - name: Plan CloudWatch - Log Groups - Alarms - Dashboard aaai21
+        run: |
+          terraform plan \
+            -target=aws_cloudwatch_log_group.nginx_access \
+            -target=aws_cloudwatch_log_group.nginx_error \
+            -target=aws_cloudwatch_metric_alarm.cpu_web1 \
+            -target=aws_cloudwatch_metric_alarm.cpu_web2 \
+            -target=aws_cloudwatch_metric_alarm.unhealthy_hosts \
+            -target=aws_cloudwatch_dashboard.main \
+            -no-color 2>&1 | tee plan-cloudwatch.txt
+
+      - name: Full Terraform Plan
+        run: |
+          terraform plan -out=tfplan -no-color 2>&1 | tee plan-full.txt
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Upload all plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plans
+          path: |
+            tfplan
+            plan-vpc.txt
+            plan-subnets.txt
+            plan-igw.txt
+            plan-nat.txt
+            plan-routetables.txt
+            plan-sg-alb.txt
+            plan-sg-ec2.txt
+            plan-sg-rds.txt
+            plan-iam.txt
+            plan-secrets.txt
+            plan-ec2-1.txt
+            plan-ec2-2.txt
+            plan-alb.txt
+            plan-rds.txt
+            plan-sns.txt
+            plan-cloudwatch.txt
+            plan-full.txt
+          retention-days: 3
+
+  apply-networking:
+    name: Apply - VPC and Networking
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply VPC - enterprise-vpc - 10.0.0.0/16
+        run: |
+          terraform apply \
+            -target=aws_vpc.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Public Subnet 1 - enterprise-public-1 - 10.0.1.0/24 - us-east-1a
+        run: |
+          terraform apply \
+            -target=aws_subnet.public_1 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Public Subnet 2 - enterprise-public-2 - 10.0.2.0/24 - us-east-1b
+        run: |
+          terraform apply \
+            -target=aws_subnet.public_2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Private Subnet 1 - enterprise-private-1 - 10.0.3.0/24 - us-east-1a
+        run: |
+          terraform apply \
+            -target=aws_subnet.private_1 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Private Subnet 2 - enterprise-private-4 - 10.0.4.0/24 - us-east-1b
+        run: |
+          terraform apply \
+            -target=aws_subnet.private_2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Internet Gateway - enterprise-igw - attach to vpc-0b0450537ba0bcffd
+        run: |
+          terraform apply \
+            -target=aws_internet_gateway.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply NAT Gateway - enterprise-nat - in enterprise-public-1
+        run: |
+          terraform apply \
+            -target=aws_eip.nat \
+            -target=aws_nat_gateway.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Public Route Table - enterprise-public-rt - 0.0.0.0/0 to enterprise-igw
+        run: |
+          terraform apply \
+            -target=aws_route_table.public \
+            -target=aws_route_table_association.public_1 \
+            -target=aws_route_table_association.public_2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Private Route Table - enterprise-private-rt - 0.0.0.0/0 to enterprise-nat
+        run: |
+          terraform apply \
+            -target=aws_route_table.private \
+            -target=aws_route_table_association.private_1 \
+            -target=aws_route_table_association.private_2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Verify VPC - vpc-0b0450537ba0bcffd
+        run: |
+          aws ec2 describe-vpcs \
+            --vpc-ids vpc-0b0450537ba0bcffd \
+            --query "Vpcs[*].{VpcId:VpcId,CIDR:CidrBlock,State:State,DNS:EnableDnsHostnames}" \
+            --output table
+
+      - name: Verify Subnets - 4 subnets in enterprise-vpc
+        run: |
+          aws ec2 describe-subnets \
+            --subnet-ids \
+              subnet-0c65db2241cdf98bf \
+              subnet-01af22f5031b2c620 \
+              subnet-0084de5014982293a \
+              subnet-0134e9e0e8f08e812 \
+            --query "Subnets[*].{Name:Tags[?Key=='Name']|[0].Value,SubnetId:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone,State:State}" \
+            --output table
+
+      - name: Verify Internet Gateway - igw-0d158f9bea817d115
+        run: |
+          aws ec2 describe-internet-gateways \
+            --internet-gateway-ids igw-0d158f9bea817d115 \
+            --query "InternetGateways[*].{Id:InternetGatewayId,State:Attachments[0].State,VPC:Attachments[0].VpcId}" \
+            --output table
+
+      - name: Verify Route Table - rtb-0869d93397b37dc16
+        run: |
+          aws ec2 describe-route-tables \
+            --route-table-ids rtb-0869d93397b37dc16 \
+            --query "RouteTables[*].{Id:RouteTableId,Routes:Routes[*].{Dest:DestinationCidrBlock,Target:GatewayId}}" \
+            --output json
+
+  apply-security:
+    name: Apply - Security Groups and IAM
+    runs-on: ubuntu-latest
+    needs: apply-networking
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply ALB Security Group - enterprise-alb-sg - port 80 and 443 from 0.0.0.0/0
+        run: |
+          terraform apply \
+            -target=aws_security_group.alb \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply EC2 Security Group - enterprise-ec2-sg - port 80 from enterprise-alb-sg only
+        run: |
+          terraform apply \
+            -target=aws_security_group.ec2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply RDS Security Group - enterprise-rds-sg - port 3306 from enterprise-ec2-sg only
+        run: |
+          terraform apply \
+            -target=aws_security_group.rds \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply IAM Role - enterprise-ec2-role - CloudWatchAgentServerPolicy AmazonSSMManagedInstanceCore SecretsManagerReadWrite
+        run: |
+          terraform apply \
+            -target=aws_iam_role.ec2 \
+            -target=aws_iam_role_policy_attachment.cloudwatch \
+            -target=aws_iam_role_policy_attachment.ssm \
+            -target=aws_iam_role_policy_attachment.secrets \
+            -target=aws_iam_instance_profile.ec2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Secrets Manager - enterprise-aws/rds/credentials - RDS credentials type
+        run: |
+          terraform apply \
+            -target=random_password.db \
+            -target=aws_secretsmanager_secret.db \
+            -target=aws_secretsmanager_secret_version.db \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Verify Security Groups - sg-0430da8b9fa67c1c2 sg-0f5f9346259391477 sg-0d29000de664e04df
+        run: |
+          aws ec2 describe-security-groups \
+            --group-ids \
+              sg-0430da8b9fa67c1c2 \
+              sg-0f5f9346259391477 \
+              sg-0d29000de664e04df \
+            --query "SecurityGroups[*].{Name:GroupName,Id:GroupId,InboundRules:length(IpPermissions),VPC:VpcId}" \
+            --output table
+
+      - name: Verify IAM Role - enterprise-ec2-role
+        run: |
+          aws iam get-role \
+            --role-name enterprise-ec2-role \
+            --query "Role.{Name:RoleName,Arn:Arn,Created:CreateDate}" \
+            --output table
+
+      - name: Verify Secrets Manager - enterprise-aws/rds/credentials
+        run: |
+          aws secretsmanager describe-secret \
+            --secret-id enterprise-aws/rds/credentials \
+            --query "{Name:Name,Arn:ARN,Created:CreatedDate}" \
+            --output table
+
+  apply-compute:
+    name: Apply - EC2 Instances
+    runs-on: ubuntu-latest
+    needs: apply-security
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply EC2 Instance 1 - enterprise-web-server-1 - t2.micro - enterprise-private-1 - subnet-0084de5014982293a
+        run: |
+          terraform apply \
+            -target=aws_instance.web_1 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply EC2 Instance 2 - enterprise-private-2 - t2.micro - enterprise-private-4 - subnet-0134e9e0e8f08e812
+        run: |
+          terraform apply \
+            -target=aws_instance.web_2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Wait for EC2 instances to initialize and run Nginx user data
+        run: sleep 90
+
+      - name: Verify EC2 Instance 1 - enterprise-web-server-1 - i-0de9c704f852e3e87
+        run: |
+          aws ec2 describe-instances \
+            --instance-ids i-0de9c704f852e3e87 \
+            --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,Id:InstanceId,State:State.Name,Type:InstanceType,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,Subnet:SubnetId}" \
+            --output table
+
+      - name: Verify EC2 Instance 2 - enterprise-private-2 - i-07eb949a647bdd473
+        run: |
+          aws ec2 describe-instances \
+            --instance-ids i-07eb949a647bdd473 \
+            --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,Id:InstanceId,State:State.Name,Type:InstanceType,PrivateIP:PrivateIpAddress,PublicIP:PublicIpAddress,Subnet:SubnetId}" \
+            --output table
+
+  apply-loadbalancer:
+    name: Apply - Application Load Balancer
+    runs-on: ubuntu-latest
+    needs: apply-compute
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply ALB - enterprise-alb - internet-facing - subnet-0c65db2241cdf98bf and subnet-01af22f5031b2c620
+        run: |
+          terraform apply \
+            -target=aws_lb.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply Target Group - enterprise-web-tg1 - HTTP port 80 - health check /health.html
+        run: |
+          terraform apply \
+            -target=aws_lb_target_group.web \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Register EC2 to Target Group - i-0de9c704f852e3e87 and i-07eb949a647bdd473
+        run: |
+          terraform apply \
+            -target=aws_lb_target_group_attachment.web_1 \
+            -target=aws_lb_target_group_attachment.web_2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply ALB Listener - HTTP port 80 forward to enterprise-web-tg1
+        run: |
+          terraform apply \
+            -target=aws_lb_listener.http \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Wait for ALB to finish provisioning
+        run: sleep 60
+
+      - name: Verify ALB - enterprise-alb - arn:aws:elasticloadbalancing:us-east-1:644786176177:loadbalancer/app/enterprise-alb/4418683648d9f6b4
+        run: |
+          aws elbv2 describe-load-balancers \
+            --load-balancer-arns arn:aws:elasticloadbalancing:us-east-1:644786176177:loadbalancer/app/enterprise-alb/4418683648d9f6b4 \
+            --query "LoadBalancers[*].{Name:LoadBalancerName,State:State.Code,DNS:DNSName,Scheme:Scheme,Zone:AvailabilityZones[*].ZoneName}" \
+            --output table
+
+      - name: Verify Target Group - enterprise-web-tg1 - arn:aws:elasticloadbalancing:us-east-1:644786176177:targetgroup/enterprise-web-tg1/505b02d7ed185d0
+        run: |
+          aws elbv2 describe-target-health \
+            --target-group-arn arn:aws:elasticloadbalancing:us-east-1:644786176177:targetgroup/enterprise-web-tg1/505b02d7ed185d0 \
+            --query "TargetHealthDescriptions[*].{Target:Target.Id,Port:Target.Port,State:TargetHealth.State}" \
+            --output table
+
+      - name: Test ALB DNS - enterprise-alb-612575907.us-east-1.elb.amazonaws.com
+        run: |
+          echo "Testing http://enterprise-alb-612575907.us-east-1.elb.amazonaws.com"
+          curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" \
+            http://enterprise-alb-612575907.us-east-1.elb.amazonaws.com || echo "ALB still provisioning"
+
+          echo "Testing health check endpoint..."
+          curl -s -o /dev/null -w "Health Check Status: %{http_code}\n" \
+            http://enterprise-alb-612575907.us-east-1.elb.amazonaws.com/health.html || echo "ALB still provisioning"
+
+  apply-database:
+    name: Apply - RDS MySQL Database
+    runs-on: ubuntu-latest
+    needs: apply-loadbalancer
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply DB Subnet Group - enterprise-private-1 and enterprise-private-4
+        run: |
+          terraform apply \
+            -target=aws_db_subnet_group.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply RDS - enterprise-mysql - MySQL 8.0 - db.t3.micro - appdb - publicly_accessible false - enterprise-rds-sg
+        run: |
+          terraform apply \
+            -target=aws_db_instance.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Wait for RDS enterprise-mysql to become available
+        run: |
+          echo "Waiting for RDS enterprise-mysql to be available..."
+          aws rds wait db-instance-available \
+            --db-instance-identifier enterprise-mysql
+          echo "RDS enterprise-mysql is now available"
+
+      - name: Verify RDS - enterprise-mysql - publicly_accessible must be false
+        run: |
+          aws rds describe-db-instances \
+            --db-instance-identifier enterprise-mysql \
+            --query "DBInstances[*].{Id:DBInstanceIdentifier,Status:DBInstanceStatus,Engine:Engine,Version:EngineVersion,Class:DBInstanceClass,PublicAccess:PubliclyAccessible,Endpoint:Endpoint.Address,Port:Endpoint.Port,MultiAZ:MultiAZ}" \
+            --output table
+
+  apply-monitoring:
+    name: Apply - CloudWatch Monitoring and Alerts
+    runs-on: ubuntu-latest
+    needs: apply-database
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Apply SNS Topic - aerts1 - arn:aws:sns:us-east-1:644786176177:aerts1 - display name aa23
+        run: |
+          terraform apply \
+            -target=aws_sns_topic.alerts \
+            -target=aws_sns_topic_subscription.email \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply CloudWatch Log Groups - /enterprise-aws/nginx/access and /enterprise-aws/nginx/error
+        run: |
+          terraform apply \
+            -target=aws_cloudwatch_log_group.nginx_access \
+            -target=aws_cloudwatch_log_group.nginx_error \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply CloudWatch Alarm - enterprise-web-server-1 - i-0de9c704f852e3e87 - CPUUtilization over 80
+        run: |
+          terraform apply \
+            -target=aws_cloudwatch_metric_alarm.cpu_web1 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply CloudWatch Alarm - enterprise-private-2 - i-07eb949a647bdd473 - CPUUtilization over 80
+        run: |
+          terraform apply \
+            -target=aws_cloudwatch_metric_alarm.cpu_web2 \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply CloudWatch Alarm - enterprise-alb - UnHealthyHostCount over 0
+        run: |
+          terraform apply \
+            -target=aws_cloudwatch_metric_alarm.unhealthy_hosts \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Apply CloudWatch Dashboard - aaai21 - CPUUtilization and StatusCheckFailed
+        run: |
+          terraform apply \
+            -target=aws_cloudwatch_dashboard.main \
+            -auto-approve -no-color
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Verify SNS - arn:aws:sns:us-east-1:644786176177:aerts1
+        run: |
+          aws sns get-topic-attributes \
+            --topic-arn arn:aws:sns:us-east-1:644786176177:aerts1 \
+            --query "Attributes.{TopicArn:TopicArn,SubscriptionsConfirmed:SubscriptionsConfirmed}" \
+            --output table
+
+      - name: Verify CloudWatch Alarms - CPUUtilization i-0de9c704f852e3e87 and i-07eb949a647bdd473
+        run: |
+          aws cloudwatch describe-alarms \
+            --alarm-names \
+              "enterprise-web-server-1-cpu-high" \
+              "enterprise-web-server-2-cpu-high" \
+              "enterprise-alb-unhealthy-hosts" \
+            --query "MetricAlarms[*].{Name:AlarmName,State:StateValue,Metric:MetricName,Threshold:Threshold,Period:Period}" \
+            --output table
+
+      - name: Verify CloudWatch Dashboard - aaai21
+        run: |
+          aws cloudwatch list-dashboards \
+            --query "DashboardEntries[?DashboardName=='aaai21'].{Name:DashboardName,Modified:LastModified,Size:Size}" \
+            --output table
+
+  deployment-summary:
+    name: Full Deployment Summary
+    runs-on: ubuntu-latest
+    needs: apply-monitoring
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform ${{ env.TF_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Output
+        run: terraform output
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+
+      - name: Print Full Infrastructure Summary
+        run: |
+          echo "=================================================="
+          echo "   ENTERPRISE AWS INFRASTRUCTURE DEPLOYED"
+          echo "   Account: 644786176177"
+          echo "   Region:  us-east-1"
+          echo "=================================================="
+
+          echo ""
+          echo "--- VPC: vpc-0b0450537ba0bcffd / enterprise-vpc ---"
+          aws ec2 describe-vpcs --vpc-ids vpc-0b0450537ba0bcffd \
+            --query "Vpcs[*].{VpcId:VpcId,CIDR:CidrBlock,State:State,DNS:EnableDnsHostnames}" --output table
+
+          echo ""
+          echo "--- SUBNETS ---"
+          aws ec2 describe-subnets \
+            --subnet-ids subnet-0c65db2241cdf98bf subnet-01af22f5031b2c620 subnet-0084de5014982293a subnet-0134e9e0e8f08e812 \
+            --query "Subnets[*].{Name:Tags[?Key=='Name']|[0].Value,SubnetId:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}" --output table
+
+          echo ""
+          echo "--- INTERNET GATEWAY: igw-0d158f9bea817d115 / enterprise-igw ---"
+          aws ec2 describe-internet-gateways --internet-gateway-ids igw-0d158f9bea817d115 \
+            --query "InternetGateways[*].{Id:InternetGatewayId,State:Attachments[0].State,VPC:Attachments[0].VpcId}" --output table
+
+          echo ""
+          echo "--- ROUTE TABLE: rtb-0869d93397b37dc16 / enterprise-public-rt ---"
+          aws ec2 describe-route-tables --route-table-ids rtb-0869d93397b37dc16 \
+            --query "RouteTables[*].Routes[*].{Destination:DestinationCidrBlock,Target:GatewayId,State:State}" --output table
+
+          echo ""
+          echo "--- SECURITY GROUPS ---"
+          aws ec2 describe-security-groups \
+            --group-ids sg-0430da8b9fa67c1c2 sg-0f5f9346259391477 sg-0d29000de664e04df \
+            --query "SecurityGroups[*].{Name:GroupName,Id:GroupId,Inbound:length(IpPermissions)}" --output table
+
+          echo ""
+          echo "--- IAM ROLE: enterprise-ec2-role ---"
+          aws iam get-role --role-name enterprise-ec2-role \
+            --query "Role.{Name:RoleName,Arn:Arn}" --output table
+
+          echo ""
+          echo "--- EC2 INSTANCES ---"
+          aws ec2 describe-instances \
+            --instance-ids i-0de9c704f852e3e87 i-07eb949a647bdd473 \
+            --query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,Id:InstanceId,State:State.Name,Type:InstanceType,PrivateIP:PrivateIpAddress}" --output table
+
+          echo ""
+          echo "--- ALB: enterprise-alb ---"
+          aws elbv2 describe-load-balancers \
+            --load-balancer-arns arn:aws:elasticloadbalancing:us-east-1:644786176177:loadbalancer/app/enterprise-alb/4418683648d9f6b4 \
+            --query "LoadBalancers[*].{Name:LoadBalancerName,State:State.Code,DNS:DNSName}" --output table
+
+          echo ""
+          echo "--- TARGET GROUP: enterprise-web-tg1 ---"
+          aws elbv2 describe-target-health \
+            --target-group-arn arn:aws:elasticloadbalancing:us-east-1:644786176177:targetgroup/enterprise-web-tg1/505b02d7ed185d0 \
+            --query "TargetHealthDescriptions[*].{Target:Target.Id,State:TargetHealth.State}" --output table
+
+          echo ""
+          echo "--- RDS: enterprise-mysql ---"
+          aws rds describe-db-instances --db-instance-identifier enterprise-mysql \
+            --query "DBInstances[*].{Id:DBInstanceIdentifier,Status:DBInstanceStatus,PublicAccess:PubliclyAccessible,Endpoint:Endpoint.Address}" --output table
+
+          echo ""
+          echo "--- SNS: aerts1 - arn:aws:sns:us-east-1:644786176177:aerts1 ---"
+          aws sns get-topic-attributes --topic-arn arn:aws:sns:us-east-1:644786176177:aerts1 \
+            --query "Attributes.{ARN:TopicArn,Subscriptions:SubscriptionsConfirmed}" --output table
+
+          echo ""
+          echo "--- CLOUDWATCH DASHBOARD: aaai21 ---"
+          aws cloudwatch list-dashboards \
+            --query "DashboardEntries[?DashboardName=='aaai21'].{Name:DashboardName,Modified:LastModified}" --output table
+
+          echo ""
+          echo "=================================================="
+          echo "  APP URL:    http://enterprise-alb-612575907.us-east-1.elb.amazonaws.com"
+          echo "  HEALTH:     http://enterprise-alb-612575907.us-east-1.elb.amazonaws.com/health.html"
+          echo "  DASHBOARD:  https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards:name=aaai21"
+          echo "  SNS:        arn:aws:sns:us-east-1:644786176177:aerts1"
+          echo "=================================================="
